@@ -220,8 +220,8 @@ fn merge_del_add_roaring_bitmap(
     fn union_del_add<'a>(
         out: &'a mut Vec<u8>,
         key: DelAdd,
-        old_obkv: KvReaderDelAdd<'a>,
-        new_obkv: KvReaderDelAdd<'a>,
+        old_obkv: &'a KvReaderDelAdd,
+        new_obkv: &'a KvReaderDelAdd,
     ) -> &'a [u8] {
         match (old_obkv.get(key), new_obkv.get(key)) {
             (None, None) => {
@@ -243,8 +243,8 @@ fn merge_del_add_roaring_bitmap(
 
     match old_bytes {
         Some(old_bytes) => {
-            let old_obkv = KvReaderDelAdd::new(old_bytes);
-            let new_obkv = KvReaderDelAdd::new(new_bytes);
+            let old_obkv: &KvReaderDelAdd = old_bytes.into();
+            let new_obkv: &KvReaderDelAdd = new_bytes.into();
 
             let mut output_deladd_obkv = KvWriterDelAdd::memory();
 

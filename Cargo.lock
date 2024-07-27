@@ -642,8 +642,10 @@ dependencies = [
 [[package]]
 name = "obkv"
 version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2e27bcfe835a379d32352112f6b8dbae2d99d16a5fff42abe6e5ba5386c1e5a"
+source = "git+https://github.com/kerollmops/obkv?branch=unsized-kvreader#2ff8bc4d11738dc52b81d17c705d78c7d5c3d84b"
+dependencies = [
+ "bytemuck",
+]
 
 [[package]]
 name = "once_cell"

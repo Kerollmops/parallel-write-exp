@@ -58,7 +58,7 @@ impl DocumentsBatchIndex {
         self.0.get_by_right(name).cloned()
     }
 
-    pub fn recreate_json(&self, document: &obkv::KvReaderU16<'_>) -> anyhow::Result<Object> {
+    pub fn recreate_json(&self, document: &obkv::KvReaderU16) -> anyhow::Result<Object> {
         let mut map = Object::new();
 
         for (k, v) in document.iter() {

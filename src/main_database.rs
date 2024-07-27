@@ -1,8 +1,9 @@
 use std::path::Path;
 
-use heed::types::Str;
-use heed::{Database, Env, EnvOpenOptions, Unspecified};
+use heed::types::{SerdeJson, Str};
+use heed::{Database, Env, EnvOpenOptions, RoTxn, Unspecified};
 
+use crate::fields_ids_map::FieldsIdsMap;
 use crate::obkv_codec::ObkvCodec;
 use crate::BEU32;
 
@@ -33,6 +34,14 @@ impl MainDatabase {
         wtxn.commit()?;
 
         Ok(MainDatabase { env, main, external_documents_ids, documents })
+    }
+
+    pub fn fields_ids_map(&self, rtxn: &RoTxn<'_>) -> heed::Result<FieldsIdsMap> {
+        Ok(self
+            .main
+            .remap_types::<Str, SerdeJson<FieldsIdsMap>>()
+            .get(rtxn, "fields-ids-map")?
+            .unwrap_or_default())
     }
 
     // /// Writes all the entries from the sled tree into LMDB. It will erase them is they already exists.

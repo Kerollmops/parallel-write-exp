@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -8,11 +8,13 @@ use std::time::Instant;
 use anyhow::Context;
 use clap::{Parser, ValueEnum};
 use documents::DocumentsBatchReader;
+use fields_ids_map::FieldsIdsMap;
 use main_database::MainDatabase;
 use memmap2::Mmap;
+use obkv::{KvReaderU16, KvWriterU16};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use temp_database::{CachedTree, TempDatabase};
-use walkdir::WalkDir;
+use walkdir::{Result, WalkDir};
 
 pub type FieldId = u16;
 pub type DocumentId = u32;
@@ -21,6 +23,7 @@ pub type Object = serde_json::Map<String, serde_json::Value>;
 
 mod del_add;
 mod documents;
+mod fields_ids_map;
 mod main_database;
 mod obkv_codec;
 mod roaring_bitmap_codec;
@@ -44,7 +47,7 @@ struct Args {
     size: byte_unit::Byte,
 }
 
-#[derive(Debug, Default, Clone, ValueEnum)]
+#[derive(Debug, Default, Clone, ValueEnum, PartialEq, Eq)]
 enum DocumentOperation {
     Replace,
     #[default]
@@ -53,6 +56,8 @@ enum DocumentOperation {
 
 fn main() -> anyhow::Result<()> {
     let Args { index_path, size, primary_key, operation } = Args::parse();
+
+    anyhow::ensure!(operation == DocumentOperation::Update, "Only updates are supported for now");
 
     let update_files_path = {
         let mut path = index_path.clone();
@@ -64,7 +69,10 @@ fn main() -> anyhow::Result<()> {
     let tempdb = TempDatabase::new()?;
 
     let before_fetch = Instant::now();
-    let document_versions = fetch_update_document_versions(update_files_path, &primary_key)?;
+    let rtxn = maindb.env.read_txn()?;
+    let fields_ids_map = maindb.fields_ids_map(&rtxn)?;
+    let (document_versions, fields_ids_map) =
+        fetch_update_document_versions(update_files_path, &primary_key, fields_ids_map)?;
     eprintln!(
         "Fetching {} document versions took {:.02?}",
         document_versions.len(),
@@ -72,36 +80,48 @@ fn main() -> anyhow::Result<()> {
     );
 
     let before_print = Instant::now();
-    document_versions.par_iter().try_for_each_init(
-        || maindb.env.read_txn(),
-        |rtxn_result, (id, offsets)| {
-            let Ok(rtxn) = rtxn_result else { todo!("handle rtxn issue") };
+    document_versions
+        .par_iter()
+        .map_init(
+            || maindb.env.read_txn(),
+            |rtxn_result, (id, offsets)| -> anyhow::Result<Box<KvReaderU16>> {
+                let Ok(rtxn) = rtxn_result else { todo!("handle rtxn issue") };
 
-            let original_bytes_len = match maindb.external_documents_ids.get(rtxn, id)? {
-                Some(internal_id) => Some(
-                    maindb
-                        .documents
-                        .get(rtxn, &internal_id)?
-                        .expect("must exists")
-                        .as_bytes()
-                        .len(),
-                ),
-                None => None,
-            };
+                let mut document = BTreeMap::new();
+                let original = match maindb.external_documents_ids.get(rtxn, id)? {
+                    Some(internal_id) => maindb.documents.get(rtxn, &internal_id)?,
+                    None => None,
+                };
 
-            let mut bytes: usize = 0;
-            for DocumentOffset { content, offset } in offsets {
-                let mut reader = DocumentsBatchReader::from_reader(Cursor::new(content.as_ref()))?;
-                let obkv = reader.get(*offset)?.expect("must exists");
-                bytes += obkv.as_bytes().len();
-            }
+                if let Some(original) = original {
+                    original.into_iter().for_each(|(k, v)| {
+                        document.insert(k, v.to_vec());
+                    });
+                }
 
-            println!("total previous versions {bytes} vs new version {original_bytes_len:?}");
+                for DocumentOffset { content, offset } in offsets.into_iter().rev() {
+                    let reader = DocumentsBatchReader::from_reader(Cursor::new(content.as_ref()))?;
+                    let (mut cursor, batch_index) = reader.into_cursor_and_fields_index();
+                    let obkv = cursor.get(*offset)?.expect("must exists");
 
-            Ok(()) as anyhow::Result<()>
-        },
-    )?;
-    eprintln!("Retrieving all document version bytes took {:.02?}", before_print.elapsed());
+                    obkv.into_iter().for_each(|(k, v)| {
+                        let field_name = batch_index.name(k).unwrap();
+                        let id = fields_ids_map.id(field_name).unwrap();
+                        document.insert(id, v.to_vec());
+                    });
+                }
+
+                // Let's construct the new obkv in memory
+                let mut writer = KvWriterU16::memory();
+                document.into_iter().for_each(|(id, value)| writer.insert(id, value).unwrap());
+                let boxed = writer.into_inner().unwrap().into_boxed_slice();
+
+                Ok(boxed.into()) as anyhow::Result<_>
+            },
+        )
+        .try_for_each(|result| result.map(drop))?;
+
+    eprintln!("Computing the new documents version took {:.02?}", before_print.elapsed());
 
     // rayon::scope_fifo(|s| {
     //     s.spawn_fifo(|_s| {
@@ -152,10 +172,15 @@ struct DocumentOffset {
 fn fetch_update_document_versions(
     update_files_path: PathBuf,
     primary_key: &str,
-) -> anyhow::Result<BTreeMap<String, Vec<DocumentOffset>>> {
-    let mut document_ids_offsets = BTreeMap::new();
+    mut fields_ids_map: FieldsIdsMap,
+) -> anyhow::Result<(HashMap<String, Vec<DocumentOffset>>, FieldsIdsMap)> {
+    let mut document_ids_offsets = HashMap::new();
+
     let mut file_count: usize = 0;
-    for result in WalkDir::new(update_files_path) {
+    for result in WalkDir::new(update_files_path)
+        // TODO handle errors
+        .sort_by_key(|entry| entry.metadata().unwrap().created().unwrap())
+    {
         let entry = result?;
         if !entry.file_type().is_file() {
             continue;
@@ -171,6 +196,9 @@ fn fetch_update_document_versions(
 
         let reader = documents::DocumentsBatchReader::from_reader(Cursor::new(content.as_ref()))?;
         let (mut batch_cursor, batch_index) = reader.into_cursor_and_fields_index();
+        batch_index.iter().for_each(|(_, name)| {
+            fields_ids_map.insert(name);
+        });
         let mut offset: u32 = 0;
         while let Some(document) = batch_cursor.next_document()? {
             let primary_key = batch_index.id(primary_key).unwrap();
@@ -191,22 +219,12 @@ fn fetch_update_document_versions(
 
     eprintln!("{file_count} files were read to get the content");
 
-    Ok(document_ids_offsets)
+    Ok((document_ids_offsets, fields_ids_map))
 }
 
 enum TreeInfo {
     Documents { tree: sled::Tree },
     WordDocids { tree: sled::Tree },
-}
-
-fn generate_documents() -> impl Iterator<Item = (u32, String)> {
-    const NUMBER_OF_WORDS: i32 = 40;
-
-    std::iter::from_fn(|| {
-        let id = rand::random::<u8>() as u32;
-        let text = lorem_ipsum_generator::lorem_ipsum_generator(NUMBER_OF_WORDS);
-        Some((id, text))
-    })
 }
 
 // TODO type the CachedTree
@@ -223,8 +241,6 @@ fn extract_word_docids(
             output.insert_del_u32(token_normalized.as_bytes(), docid)?;
         }
     }
-
-    std::thread::sleep(std::time::Duration::from_millis(200));
 
     for token in new_doc.split_whitespace() {
         let token_normalized = token.to_lowercase();

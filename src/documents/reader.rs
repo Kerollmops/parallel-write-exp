@@ -49,18 +49,6 @@ impl<R: io::Read + io::Seek> DocumentsBatchReader<R> {
         &self.fields_index
     }
 
-    pub fn get(
-        &mut self,
-        offset: u32,
-    ) -> Result<Option<KvReader<'_, FieldId>>, DocumentsBatchCursorError> {
-        match self.cursor.move_on_key_equal_to(offset.to_be_bytes())? {
-            Some((key, value)) if key != DOCUMENTS_BATCH_INDEX_KEY => {
-                Ok(Some(KvReader::new(value)))
-            }
-            _otherwise => Ok(None),
-        }
-    }
-
     /// This method returns a forward cursor over the documents.
     pub fn into_cursor_and_fields_index(self) -> (DocumentsBatchCursor<R>, DocumentsBatchIndex) {
         let DocumentsBatchReader { cursor, fields_index } = self;
@@ -83,15 +71,23 @@ impl<R> DocumentsBatchCursor<R> {
 }
 
 impl<R: io::Read + io::Seek> DocumentsBatchCursor<R> {
+    pub fn get(
+        &mut self,
+        offset: u32,
+    ) -> Result<Option<&KvReader<FieldId>>, DocumentsBatchCursorError> {
+        match self.cursor.move_on_key_equal_to(offset.to_be_bytes())? {
+            Some((key, value)) if key != DOCUMENTS_BATCH_INDEX_KEY => Ok(Some(value.into())),
+            _otherwise => Ok(None),
+        }
+    }
+
     /// Returns the next document, starting from the first one. Subsequent calls to
     /// `next_document` advance the document reader until all the documents have been read.
     pub fn next_document(
         &mut self,
-    ) -> Result<Option<KvReader<'_, FieldId>>, DocumentsBatchCursorError> {
+    ) -> Result<Option<&KvReader<FieldId>>, DocumentsBatchCursorError> {
         match self.cursor.move_on_next()? {
-            Some((key, value)) if key != DOCUMENTS_BATCH_INDEX_KEY => {
-                Ok(Some(KvReader::new(value)))
-            }
+            Some((key, value)) if key != DOCUMENTS_BATCH_INDEX_KEY => Ok(Some(value.into())),
             _otherwise => Ok(None),
         }
     }
