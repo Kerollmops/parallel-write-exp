@@ -18,6 +18,7 @@ pub(crate) struct TempDatabase {
 impl TempDatabase {
     pub fn new() -> sled::Result<Self> {
         let tempdir = tempfile::tempdir()?;
+        eprintln!("Creating temporary sled folder in {}", tempdir.path().display());
         let db = sled::open(tempdir.path())?;
         let cache_size = NonZeroUsize::new(1000).unwrap();
 
@@ -162,11 +163,13 @@ impl CachedTree {
             }
             DelAddRoaringBitmap { del: None, add: None } => return Ok(()),
         }
-        self.tree.merge(key, value_writer.into_inner().unwrap()).map(drop)
+        // self.tree.merge(key, value_writer.into_inner().unwrap()).map(drop)
+        Ok(())
     }
 
     pub fn direct_insert(&mut self, key: &[u8], val: &[u8]) -> sled::Result<()> {
-        self.tree.merge(key, val).map(drop)
+        // self.tree.merge(key, val).map(drop)
+        Ok(())
     }
 
     pub fn into_tree(mut self) -> sled::Result<Tree> {
@@ -250,11 +253,11 @@ fn merge_del_add_roaring_bitmap(
 
             let mut buffer = Vec::new();
             let del_bytes = union_del_add(&mut buffer, DelAdd::Deletion, old_obkv, new_obkv);
-            output_deladd_obkv.insert(DelAdd::Deletion, &del_bytes).unwrap();
+            output_deladd_obkv.insert(DelAdd::Deletion, del_bytes).unwrap();
 
             buffer.clear();
             let add_bytes = union_del_add(&mut buffer, DelAdd::Addition, old_obkv, new_obkv);
-            output_deladd_obkv.insert(DelAdd::Addition, &add_bytes).unwrap();
+            output_deladd_obkv.insert(DelAdd::Addition, add_bytes).unwrap();
 
             Some(output_deladd_obkv.into_inner().unwrap())
         }

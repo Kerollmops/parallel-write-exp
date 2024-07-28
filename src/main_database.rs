@@ -9,6 +9,7 @@ use crate::obkv_codec::ObkvCodec;
 use crate::roaring_bitmap_codec::RoaringBitmapCodec;
 use crate::BEU32;
 
+#[derive(Clone)]
 pub(crate) struct MainDatabase {
     pub(crate) env: Env,
 

@@ -6,11 +6,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Context;
+use charabia::Tokenize;
 use clap::{Parser, ValueEnum};
-use concurrent_docids::ConcurrentDocids;
 use documents::DocumentsBatchReader;
 use fields_ids_map::FieldsIdsMap;
-use heed::RoTxn;
+use heed::types::Bytes;
+use heed::{PutFlags, RoTxn};
 use main_database::MainDatabase;
 use memmap2::Mmap;
 use obkv::{KvReaderU16, KvWriterU16};
@@ -79,8 +80,10 @@ fn main() -> anyhow::Result<()> {
     let used_document_ids = maindb.document_ids(&rtxn)?;
     let mut sequential_docids = SequentialDocids::new(&used_document_ids);
 
+    let rtxn = maindb.env.read_txn()?;
     let (document_versions, fields_ids_map) = fetch_update_document_versions(
         &maindb,
+        &rtxn,
         &mut sequential_docids,
         update_files_path,
         &primary_key,
@@ -97,60 +100,86 @@ fn main() -> anyhow::Result<()> {
     // Its purpose is to generate the new version of the documents by merging it with the version of the RoTxn.
     let merged_documents = document_versions.par_iter().map_init(
         || maindb.env.read_txn(),
-        |result_rtxn, offset| merge_document_obkv(result_rtxn, &maindb, &fields_ids_map, offset),
+        |result_rtxn, offset| {
+            let Ok(rtxn) = result_rtxn else { todo!("handle rtxn issue") };
+            merge_document_obkv(rtxn, &maindb, &fields_ids_map, offset)
+        },
     );
 
-    merged_documents.try_for_each(|result| result.map(drop))?;
+    let (tree_infos_sender, tree_infos) = std::sync::mpsc::sync_channel(100);
+
+    rayon::scope_fifo(|s| {
+        // This task is meant to send the documents directly to the LMDB writer.
+        // It is the first task because it's the fastest to process.
+        s.spawn_fifo(|_s| {
+            let result = merged_documents.clone().try_for_each(|result| {
+                let (docid, document) = result?;
+                let _ = tree_infos_sender.send(TreeInfo::Document { docid, document });
+                Ok(())
+            });
+
+            if let Err(error) = result {
+                let _ = tree_infos_sender.send(TreeInfo::Error(error));
+            }
+        });
+
+        s.spawn_fifo(|_s| {
+            merged_documents
+                .clone()
+                .try_for_each_init(
+                    || {
+                        let cache = tempdb.del_add_word_docids.clone();
+                        let guarded_cache = scopeguard::guard(cache, |cache| {
+                            // let tree = cache.into_tree().unwrap();
+                            // eprintln!("use the tree with {} values", tree.len());
+                            eprintln!("use the tree");
+                        });
+                        maindb.env.read_txn().map(|rtxn| (rtxn, guarded_cache))
+                    },
+                    |init_result, result| {
+                        let Ok((rtxn, cache)) = init_result else { todo!("handle rtxn issue") };
+                        let (internal_docid, new_document) = result?;
+                        let old_document = maindb.documents.get(rtxn, &internal_docid)?;
+                        extract_word_docids(internal_docid, old_document, &new_document, cache)?;
+                        Ok(()) as anyhow::Result<_>
+                    },
+                )
+                .unwrap()
+        });
+
+        eprintln!("I am running...");
+
+        let mut wtxn = maindb.env.write_txn()?;
+        for tree_info in tree_infos {
+            match tree_info {
+                TreeInfo::Document { docid, document } => {
+                    maindb.documents.remap_data_type::<Bytes>().put(
+                        &mut wtxn,
+                        &docid,
+                        document.as_bytes(),
+                    )?;
+                }
+                TreeInfo::WordDocids { tree } => todo!(),
+                TreeInfo::Error(_) => todo!(),
+            }
+            rayon::yield_now();
+        }
+        // wtxn.commit()?;
+
+        Ok(()) as anyhow::Result<_>
+    })?;
 
     eprintln!("Computing the new documents version took {:.02?}", before_print.elapsed());
-
-    // rayon::scope_fifo(|s| {
-    //     s.spawn_fifo(|_s| {
-    //         // ...
-    //     });
-    // });
-
-    // generate_documents()
-    //     .take(100)
-    //     .par_bridge()
-    //     .map_init(
-    //         || {
-    //             let _guard = scopeguard::guard((), |_| {
-    //                 println!("Hello Scope Exit!");
-    //             });
-    //             Ok((maindb.env.read_txn()?, tempdb.del_add_word_docids.clone(), _guard))
-    //                 as heed::Result<_>
-    //         },
-    //         |result, (docid, text)| {
-    //             let Ok((rtxn, ref mut cache, _guard)) = result.as_mut() else {
-    //                 todo!("handle the error")
-    //             };
-    //             let old = maindb.documents.get(rtxn, &docid)?;
-    //             extract_word_docids(docid, old, &text, cache)?;
-
-    //             Ok(()) as anyhow::Result<()>
-    //         },
-    //     )
-    //     .for_each(|_| ());
-
-    // let mut wtxn = maindb.env.write_txn()?;
-    // for tree_info in tree_infos {
-    //     // ...
-    // }
-
-    // wtxn.commit()?;
 
     Ok(())
 }
 
 fn merge_document_obkv(
-    rtxn_result: &mut heed::Result<RoTxn>,
+    rtxn: &RoTxn,
     maindb: &MainDatabase,
     fields_ids_map: &FieldsIdsMap,
     (_external_id, (internal_id, offsets)): (&String, &(DocumentId, Vec<DocumentOffset>)),
 ) -> anyhow::Result<(DocumentId, Box<KvReaderU16>)> {
-    let Ok(rtxn) = rtxn_result else { todo!("handle rtxn issue") };
-
     let mut document = BTreeMap::new();
     let original_obkv = maindb.documents.get(rtxn, internal_id)?;
 
@@ -189,12 +218,12 @@ struct DocumentOffset {
 // NOTE this is only useful when the update is a PATCH (an update not a replace).
 fn fetch_update_document_versions(
     maindb: &MainDatabase,
+    rtxn: &RoTxn,
     sequential_docids: &mut SequentialDocids,
     update_files_path: PathBuf,
     primary_key: &str,
     mut fields_ids_map: FieldsIdsMap,
 ) -> anyhow::Result<(HashMap<String, (DocumentId, Vec<DocumentOffset>)>, FieldsIdsMap)> {
-    let rtxn = maindb.env.read_txn()?;
     let mut document_ids_offsets = HashMap::new();
 
     let mut file_count: usize = 0;
@@ -250,28 +279,40 @@ fn fetch_update_document_versions(
 }
 
 enum TreeInfo {
-    Documents { tree: sled::Tree },
+    Document { docid: DocumentId, document: Box<KvReaderU16> },
     WordDocids { tree: sled::Tree },
+    Error(anyhow::Error),
 }
 
 // TODO type the CachedTree
 fn extract_word_docids(
     docid: u32,
-    previous_doc: Option<&str>,
-    new_doc: &str,
+    previous_doc: Option<&KvReaderU16>,
+    new_doc: &KvReaderU16,
     output: &mut CachedTree,
 ) -> sled::Result<()> {
     if let Some(previous_doc) = previous_doc {
-        for token in previous_doc.split_whitespace() {
-            // TODO use charabia
-            let token_normalized = token.to_lowercase();
-            output.insert_del_u32(token_normalized.as_bytes(), docid)?;
+        for (_, v) in previous_doc.iter() {
+            // Only manage the direct JSON strings
+            if v.first().zip(v.last()) == Some((&b'"', &b'"')) {
+                let s = std::str::from_utf8(&v[1..v.len() - 1]).unwrap();
+                for token in s.tokenize().filter(|t| t.is_word()) {
+                    let key = token.lemma().as_bytes();
+                    output.insert_del_u32(key, docid)?;
+                }
+            }
         }
     }
 
-    for token in new_doc.split_whitespace() {
-        let token_normalized = token.to_lowercase();
-        output.insert_add_u32(token_normalized.as_bytes(), docid)?;
+    for (_, v) in new_doc.iter() {
+        // Only manage the direct JSON strings
+        if v.first().zip(v.last()) == Some((&b'"', &b'"')) {
+            let s = std::str::from_utf8(&v[1..v.len() - 1]).unwrap();
+            for token in s.tokenize().filter(|t| t.is_word()) {
+                let key = token.lemma().as_bytes();
+                output.insert_add_u32(key, docid)?;
+            }
+        }
     }
 
     Ok(())
@@ -279,8 +320,8 @@ fn extract_word_docids(
 
 fn extract_word_pair_proximity_docids(
     docid: u32,
-    previous_doc: Option<&str>,
-    new_doc: &str,
+    previous_doc: Option<&KvReaderU16>,
+    new_doc: &KvReaderU16,
     output: &mut CachedTree,
 ) -> sled::Result<()> {
     todo!()
