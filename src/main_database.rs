@@ -2,9 +2,11 @@ use std::path::Path;
 
 use heed::types::{SerdeJson, Str};
 use heed::{Database, Env, EnvOpenOptions, RoTxn, Unspecified};
+use roaring::RoaringBitmap;
 
 use crate::fields_ids_map::FieldsIdsMap;
 use crate::obkv_codec::ObkvCodec;
+use crate::roaring_bitmap_codec::RoaringBitmapCodec;
 use crate::BEU32;
 
 pub(crate) struct MainDatabase {
@@ -34,6 +36,14 @@ impl MainDatabase {
         wtxn.commit()?;
 
         Ok(MainDatabase { env, main, external_documents_ids, documents })
+    }
+
+    pub fn document_ids(&self, rtxn: &RoTxn) -> heed::Result<RoaringBitmap> {
+        Ok(self
+            .main
+            .remap_types::<Str, RoaringBitmapCodec>()
+            .get(rtxn, "document-ids")?
+            .unwrap_or_default())
     }
 
     pub fn fields_ids_map(&self, rtxn: &RoTxn<'_>) -> heed::Result<FieldsIdsMap> {

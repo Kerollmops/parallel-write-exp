@@ -7,26 +7,31 @@ use std::time::Instant;
 
 use anyhow::Context;
 use clap::{Parser, ValueEnum};
+use concurrent_docids::ConcurrentDocids;
 use documents::DocumentsBatchReader;
 use fields_ids_map::FieldsIdsMap;
+use heed::RoTxn;
 use main_database::MainDatabase;
 use memmap2::Mmap;
 use obkv::{KvReaderU16, KvWriterU16};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use sequential_docids::SequentialDocids;
 use temp_database::{CachedTree, TempDatabase};
-use walkdir::{Result, WalkDir};
+use walkdir::WalkDir;
 
 pub type FieldId = u16;
 pub type DocumentId = u32;
 pub type BEU32 = heed::types::U32<heed::byteorder::BE>;
 pub type Object = serde_json::Map<String, serde_json::Value>;
 
+mod concurrent_docids;
 mod del_add;
 mod documents;
 mod fields_ids_map;
 mod main_database;
 mod obkv_codec;
 mod roaring_bitmap_codec;
+mod sequential_docids;
 mod temp_database;
 
 #[derive(Parser, Debug)]
@@ -43,7 +48,7 @@ struct Args {
     operation: DocumentOperation,
 
     /// Max size of the database
-    #[arg(long, default_value = "20GiB")]
+    #[arg(long, default_value = "200GiB")]
     size: byte_unit::Byte,
 }
 
@@ -71,55 +76,31 @@ fn main() -> anyhow::Result<()> {
     let before_fetch = Instant::now();
     let rtxn = maindb.env.read_txn()?;
     let fields_ids_map = maindb.fields_ids_map(&rtxn)?;
-    let (document_versions, fields_ids_map) =
-        fetch_update_document_versions(update_files_path, &primary_key, fields_ids_map)?;
+    let used_document_ids = maindb.document_ids(&rtxn)?;
+    let mut sequential_docids = SequentialDocids::new(&used_document_ids);
+
+    let (document_versions, fields_ids_map) = fetch_update_document_versions(
+        &maindb,
+        &mut sequential_docids,
+        update_files_path,
+        &primary_key,
+        fields_ids_map,
+    )?;
     eprintln!(
-        "Fetching {} document versions took {:.02?}",
+        "Fetching {} document versions and generating missing docids took {:.02?}",
         document_versions.len(),
         before_fetch.elapsed()
     );
 
     let before_print = Instant::now();
-    document_versions
-        .par_iter()
-        .map_init(
-            || maindb.env.read_txn(),
-            |rtxn_result, (id, offsets)| -> anyhow::Result<Box<KvReaderU16>> {
-                let Ok(rtxn) = rtxn_result else { todo!("handle rtxn issue") };
+    // This rayon iterator can be cloned and used in multiple threads.
+    // Its purpose is to generate the new version of the documents by merging it with the version of the RoTxn.
+    let merged_documents = document_versions.par_iter().map_init(
+        || maindb.env.read_txn(),
+        |result_rtxn, offset| merge_document_obkv(result_rtxn, &maindb, &fields_ids_map, offset),
+    );
 
-                let mut document = BTreeMap::new();
-                let original = match maindb.external_documents_ids.get(rtxn, id)? {
-                    Some(internal_id) => maindb.documents.get(rtxn, &internal_id)?,
-                    None => None,
-                };
-
-                if let Some(original) = original {
-                    original.into_iter().for_each(|(k, v)| {
-                        document.insert(k, v.to_vec());
-                    });
-                }
-
-                for DocumentOffset { content, offset } in offsets.into_iter().rev() {
-                    let reader = DocumentsBatchReader::from_reader(Cursor::new(content.as_ref()))?;
-                    let (mut cursor, batch_index) = reader.into_cursor_and_fields_index();
-                    let obkv = cursor.get(*offset)?.expect("must exists");
-
-                    obkv.into_iter().for_each(|(k, v)| {
-                        let field_name = batch_index.name(k).unwrap();
-                        let id = fields_ids_map.id(field_name).unwrap();
-                        document.insert(id, v.to_vec());
-                    });
-                }
-
-                // Let's construct the new obkv in memory
-                let mut writer = KvWriterU16::memory();
-                document.into_iter().for_each(|(id, value)| writer.insert(id, value).unwrap());
-                let boxed = writer.into_inner().unwrap().into_boxed_slice();
-
-                Ok(boxed.into()) as anyhow::Result<_>
-            },
-        )
-        .try_for_each(|result| result.map(drop))?;
+    merged_documents.try_for_each(|result| result.map(drop))?;
 
     eprintln!("Computing the new documents version took {:.02?}", before_print.elapsed());
 
@@ -162,6 +143,43 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn merge_document_obkv(
+    rtxn_result: &mut heed::Result<RoTxn>,
+    maindb: &MainDatabase,
+    fields_ids_map: &FieldsIdsMap,
+    (_external_id, (internal_id, offsets)): (&String, &(DocumentId, Vec<DocumentOffset>)),
+) -> anyhow::Result<(DocumentId, Box<KvReaderU16>)> {
+    let Ok(rtxn) = rtxn_result else { todo!("handle rtxn issue") };
+
+    let mut document = BTreeMap::new();
+    let original_obkv = maindb.documents.get(rtxn, internal_id)?;
+
+    if let Some(original_obkv) = original_obkv {
+        original_obkv.into_iter().for_each(|(k, v)| {
+            document.insert(k, v.to_vec());
+        });
+    }
+
+    for DocumentOffset { content, offset } in offsets.iter().rev() {
+        let reader = DocumentsBatchReader::from_reader(Cursor::new(content.as_ref()))?;
+        let (mut cursor, batch_index) = reader.into_cursor_and_fields_index();
+        let obkv = cursor.get(*offset)?.expect("must exists");
+
+        obkv.into_iter().for_each(|(k, v)| {
+            let field_name = batch_index.name(k).unwrap();
+            let id = fields_ids_map.id(field_name).unwrap();
+            document.insert(id, v.to_vec());
+        });
+    }
+
+    // Let's construct the new obkv in memory
+    let mut writer = KvWriterU16::memory();
+    document.into_iter().for_each(|(id, value)| writer.insert(id, value).unwrap());
+    let boxed = writer.into_inner().unwrap().into_boxed_slice();
+
+    Ok((*internal_id, boxed.into())) as anyhow::Result<_>
+}
+
 struct DocumentOffset {
     pub content: Arc<Mmap>,
     pub offset: u32,
@@ -170,10 +188,13 @@ struct DocumentOffset {
 // TODO use SmallString/SmartString instead, document IDs are short.
 // NOTE this is only useful when the update is a PATCH (an update not a replace).
 fn fetch_update_document_versions(
+    maindb: &MainDatabase,
+    sequential_docids: &mut SequentialDocids,
     update_files_path: PathBuf,
     primary_key: &str,
     mut fields_ids_map: FieldsIdsMap,
-) -> anyhow::Result<(HashMap<String, Vec<DocumentOffset>>, FieldsIdsMap)> {
+) -> anyhow::Result<(HashMap<String, (DocumentId, Vec<DocumentOffset>)>, FieldsIdsMap)> {
+    let rtxn = maindb.env.read_txn()?;
     let mut document_ids_offsets = HashMap::new();
 
     let mut file_count: usize = 0;
@@ -204,12 +225,18 @@ fn fetch_update_document_versions(
             let primary_key = batch_index.id(primary_key).unwrap();
             let document_id = document.get(primary_key).unwrap();
             let document_id = std::str::from_utf8(document_id).unwrap();
+
             let document_offset = DocumentOffset { content: content.clone(), offset };
             match document_ids_offsets.get_mut(document_id) {
                 None => {
-                    document_ids_offsets.insert(document_id.to_string(), vec![document_offset]);
+                    let docid = match maindb.external_documents_ids.get(&rtxn, document_id)? {
+                        Some(docid) => docid,
+                        None => sequential_docids.next().context("no more available docids")?,
+                    };
+                    document_ids_offsets
+                        .insert(document_id.to_string(), (docid, vec![document_offset]));
                 }
-                Some(offsets) => offsets.push(document_offset),
+                Some((_, offsets)) => offsets.push(document_offset),
             }
             offset += 1;
         }
