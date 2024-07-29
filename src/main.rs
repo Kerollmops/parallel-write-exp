@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Context;
-use charabia::{Tokenize, Tokenizer, TokenizerBuilder};
+use charabia::normalizer::NormalizerOption;
+use charabia::{Normalize, Tokenize, TokenizerBuilder};
 use clap::{Parser, ValueEnum};
 use documents::DocumentsBatchReader;
 use fields_ids_map::FieldsIdsMap;
@@ -30,6 +31,7 @@ pub type Object = serde_json::Map<String, serde_json::Value>;
 mod concurrent_docids;
 mod del_add;
 mod documents;
+mod extract;
 mod fields_ids_map;
 mod items_pool;
 mod main_database;
@@ -110,10 +112,13 @@ fn main() -> anyhow::Result<()> {
     );
 
     let documents_count = document_versions.len() as u64;
-    let style = ProgressStyle::with_template("{msg:<15} {wide_bar} {pos}/{len} {eta}").unwrap();
+    if documents_count == 0 {
+        return Ok(());
+    }
 
-    // TODO Make this number configurable and maybe a multiple of the number of indexing threads.
+    let style = ProgressStyle::with_template("{msg:<15} {wide_bar} {pos}/{len} {eta}").unwrap();
     let (tree_infos_sender, tree_infos) = crossbeam_channel::unbounded();
+
     rayon::scope(|s| {
         s.spawn(|_s| {
             // This task is meant to send the documents directly to the LMDB writer.
@@ -138,44 +143,43 @@ fn main() -> anyhow::Result<()> {
             ));
 
             let before = Instant::now();
-            let word_docids_cache_pool = ItemsPool::new(|| Ok(tempdb.del_add_word_docids.clone()));
-            let tokenizers_poll =
-                ItemsPool::new(|| Ok(TokenizerBuilder::default().into_tokenizer()));
+            let context_pool = ItemsPool::new(|| {
+                Ok((
+                    maindb.env.read_txn()?,
+                    TokenizerBuilder::default().into_tokenizer(),
+                    tempdb.del_add_word_docids.clone(),
+                ))
+            });
             let p = ProgressBar::new(documents_count).with_style(style).with_message("word docids");
-            let result = merged_documents.clone().progress_with(p.clone()).try_for_each_init(
-                || maindb.env.read_txn(),
-                |rtxn_result, result| {
-                    let Ok(rtxn) = rtxn_result else { todo!("handle rtxn issue") };
-                    word_docids_cache_pool.with(|cache| {
-                        tokenizers_poll.with(|tokenizer| {
-                            let (docid, new_document) = result?;
-                            let old_document = maindb.documents.get(rtxn, &docid)?;
-                            extract_word_docids(
-                                docid,
-                                old_document,
-                                &new_document,
-                                tokenizer,
-                                cache,
-                            )?;
-                            Ok(()) as anyhow::Result<_>
-                        })
-                    })
-                },
-            );
+            let result = merged_documents.clone().progress_with(p.clone()).try_for_each(|result| {
+                context_pool.with(|(rtxn, tokenizer, cache)| {
+                    let (docid, new_document) = result?;
+                    let old_document = maindb.documents.get(rtxn, &docid)?;
+                    extract::extract_word_docids(
+                        docid,
+                        old_document,
+                        &new_document,
+                        tokenizer,
+                        cache,
+                    )?;
+                    Ok(()) as anyhow::Result<_>
+                })
+            });
 
             if let Err(error) = result {
                 let _ = tree_infos_sender.send(TreeInfo::Error(error));
             }
 
-            let result: sled::Result<Vec<_>> = word_docids_cache_pool
+            let result: sled::Result<Vec<_>> = context_pool
                 .into_items()
                 .par_bridge()
-                .map(|cache| cache.into_tree())
+                .map(|(_rtxn, _tokenizer, cache)| cache.into_tree())
                 .collect();
 
-            if let Err(error) = result {
-                let _ = tree_infos_sender.send(TreeInfo::Error(error.into()));
-            }
+            let _ = tree_infos_sender.send(match result {
+                Ok(mut trees) => TreeInfo::WordDocids { tree: trees.pop().unwrap() },
+                Err(error) => TreeInfo::Error(error.into()),
+            });
 
             p.finish_with_message(format!(
                 "Done extracting word docids in {:.02?}",
@@ -323,48 +327,4 @@ enum TreeInfo {
     Document { docid: DocumentId, document: Box<KvReaderU16> },
     WordDocids { tree: sled::Tree },
     Error(anyhow::Error),
-}
-
-// TODO type the CachedTree
-fn extract_word_docids(
-    docid: u32,
-    previous_doc: Option<&KvReaderU16>,
-    new_doc: &KvReaderU16,
-    tokenizer: &Tokenizer,
-    output: &mut CachedTree,
-) -> sled::Result<()> {
-    if let Some(previous_doc) = previous_doc {
-        for (_, v) in previous_doc.iter() {
-            // Only manage the direct JSON strings
-            if v.first().zip(v.last()) == Some((&b'"', &b'"')) {
-                let s = std::str::from_utf8(&v[1..v.len() - 1]).unwrap();
-                for token in tokenizer.tokenize(s).filter(|t| t.is_word()) {
-                    let key = token.lemma().as_bytes();
-                    output.insert_del_u32(key, docid)?;
-                }
-            }
-        }
-    }
-
-    for (_, v) in new_doc.iter() {
-        // Only manage the direct JSON strings
-        if v.first().zip(v.last()) == Some((&b'"', &b'"')) {
-            let s = std::str::from_utf8(&v[1..v.len() - 1]).unwrap();
-            for token in tokenizer.tokenize(s).filter(|t| t.is_word()) {
-                let key = token.lemma().as_bytes();
-                output.insert_add_u32(key, docid)?;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn extract_word_pair_proximity_docids(
-    docid: u32,
-    previous_doc: Option<&KvReaderU16>,
-    new_doc: &KvReaderU16,
-    output: &mut CachedTree,
-) -> sled::Result<()> {
-    todo!()
 }
