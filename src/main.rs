@@ -6,18 +6,18 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Context;
-use charabia::Tokenize;
+use charabia::{Tokenize, Tokenizer, TokenizerBuilder};
 use clap::{Parser, ValueEnum};
 use documents::DocumentsBatchReader;
 use fields_ids_map::FieldsIdsMap;
 use heed::types::Bytes;
 use heed::RoTxn;
-use indicatif::{MultiProgress, ParallelProgressIterator, ProgressBar, ProgressStyle};
+use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
 use items_pool::ItemsPool;
 use main_database::MainDatabase;
 use memmap2::Mmap;
 use obkv::{KvReaderU16, KvWriterU16};
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use rayon::iter::{IntoParallelRefIterator, ParallelBridge, ParallelIterator};
 use sequential_docids::SequentialDocids;
 use temp_database::{CachedTree, TempDatabase};
 use walkdir::WalkDir;
@@ -109,59 +109,20 @@ fn main() -> anyhow::Result<()> {
         },
     );
 
+    let documents_count = document_versions.len() as u64;
+    let style = ProgressStyle::with_template("{msg:<15} {wide_bar} {pos}/{len} {eta}").unwrap();
+
     // TODO Make this number configurable and maybe a multiple of the number of indexing threads.
-    let (tree_infos_sender, tree_infos) = std::sync::mpsc::channel();
-
-    let style = ProgressStyle::with_template("{msg:<15} {wide_bar} {pos}/{len}").unwrap();
-    let mp = MultiProgress::new();
-    let docp = mp.add(
-        ProgressBar::new(document_versions.len() as u64)
-            .with_style(style.clone())
-            .with_message("documents"),
-    );
-    let wdp = mp.add(
-        ProgressBar::new(document_versions.len() as u64)
-            .with_style(style)
-            .with_message("word docid"),
-    );
-
+    let (tree_infos_sender, tree_infos) = crossbeam_channel::unbounded();
     rayon::scope(|s| {
         s.spawn(|_s| {
+            // This task is meant to send the documents directly to the LMDB writer.
+            // It is the first task because it's the fastest to process.
             let before = Instant::now();
-            let word_docids_cache_pool = ItemsPool::new(|| {
-                println!("Creating new word docids cached tree");
-                tempdb.del_add_word_docids.clone()
-            });
-            merged_documents
-                .clone()
-                .progress_with(wdp)
-                .try_for_each_init(
-                    || maindb.env.read_txn(),
-                    |rtxn_result, result| {
-                        let Ok(rtxn) = rtxn_result else { todo!("handle rtxn issue") };
-                        word_docids_cache_pool.with(|cache| {
-                            let (docid, new_document) = result?;
-                            let old_document = maindb.documents.get(rtxn, &docid)?;
-                            extract_word_docids(docid, old_document, &new_document, cache)?;
-                            Ok(()) as anyhow::Result<_>
-                        })
-                    },
-                )
-                .unwrap();
-
-            // TODO Do that in parallel and handle errors
-            for cache in word_docids_cache_pool.into_items() {
-                cache.into_tree().unwrap();
-            }
-
-            eprintln!("Done extracting word docids in {:.02?}", before.elapsed());
-        });
-
-        // This task is meant to send the documents directly to the LMDB writer.
-        // It is the first task because it's the fastest to process.
-        s.spawn(|_s| {
-            let before = Instant::now();
-            let result = merged_documents.clone().progress_with(docp).try_for_each(|result| {
+            let p = ProgressBar::new(documents_count)
+                .with_style(style.clone())
+                .with_message("documents");
+            let result = merged_documents.clone().progress_with(p.clone()).try_for_each(|result| {
                 let (docid, document) = result?;
                 let _ = tree_infos_sender.send(TreeInfo::Document { docid, document });
                 Ok(())
@@ -171,7 +132,56 @@ fn main() -> anyhow::Result<()> {
                 let _ = tree_infos_sender.send(TreeInfo::Error(error));
             }
 
-            eprintln!("Done extracting documents in {:.02?}", before.elapsed());
+            p.finish_with_message(format!(
+                "Done extracting documents in {:.02?}",
+                before.elapsed()
+            ));
+
+            let before = Instant::now();
+            let word_docids_cache_pool = ItemsPool::new(|| Ok(tempdb.del_add_word_docids.clone()));
+            let tokenizers_poll =
+                ItemsPool::new(|| Ok(TokenizerBuilder::default().into_tokenizer()));
+            let p = ProgressBar::new(documents_count).with_style(style).with_message("word docids");
+            let result = merged_documents.clone().progress_with(p.clone()).try_for_each_init(
+                || maindb.env.read_txn(),
+                |rtxn_result, result| {
+                    let Ok(rtxn) = rtxn_result else { todo!("handle rtxn issue") };
+                    word_docids_cache_pool.with(|cache| {
+                        tokenizers_poll.with(|tokenizer| {
+                            let (docid, new_document) = result?;
+                            let old_document = maindb.documents.get(rtxn, &docid)?;
+                            extract_word_docids(
+                                docid,
+                                old_document,
+                                &new_document,
+                                tokenizer,
+                                cache,
+                            )?;
+                            Ok(()) as anyhow::Result<_>
+                        })
+                    })
+                },
+            );
+
+            if let Err(error) = result {
+                let _ = tree_infos_sender.send(TreeInfo::Error(error));
+            }
+
+            let result: sled::Result<Vec<_>> = word_docids_cache_pool
+                .into_items()
+                .par_bridge()
+                .map(|cache| cache.into_tree())
+                .collect();
+
+            if let Err(error) = result {
+                let _ = tree_infos_sender.send(TreeInfo::Error(error.into()));
+            }
+
+            p.finish_with_message(format!(
+                "Done extracting word docids in {:.02?}",
+                before.elapsed()
+            ));
+
             // WARN You *must* explicitly drop it or it will be dropped too late
             drop(tree_infos_sender);
         });
@@ -191,7 +201,7 @@ fn main() -> anyhow::Result<()> {
                 TreeInfo::WordDocids { tree } => todo!(),
                 TreeInfo::Error(_) => todo!(),
             }
-            // rayon::yield_now();
+            rayon::yield_now();
         }
         // wtxn.commit()?;
 
@@ -320,6 +330,7 @@ fn extract_word_docids(
     docid: u32,
     previous_doc: Option<&KvReaderU16>,
     new_doc: &KvReaderU16,
+    tokenizer: &Tokenizer,
     output: &mut CachedTree,
 ) -> sled::Result<()> {
     if let Some(previous_doc) = previous_doc {
@@ -327,7 +338,7 @@ fn extract_word_docids(
             // Only manage the direct JSON strings
             if v.first().zip(v.last()) == Some((&b'"', &b'"')) {
                 let s = std::str::from_utf8(&v[1..v.len() - 1]).unwrap();
-                for token in s.tokenize().filter(|t| t.is_word()) {
+                for token in tokenizer.tokenize(s).filter(|t| t.is_word()) {
                     let key = token.lemma().as_bytes();
                     output.insert_del_u32(key, docid)?;
                 }
@@ -339,7 +350,7 @@ fn extract_word_docids(
         // Only manage the direct JSON strings
         if v.first().zip(v.last()) == Some((&b'"', &b'"')) {
             let s = std::str::from_utf8(&v[1..v.len() - 1]).unwrap();
-            for token in s.tokenize().filter(|t| t.is_word()) {
+            for token in tokenizer.tokenize(s).filter(|t| t.is_word()) {
                 let key = token.lemma().as_bytes();
                 output.insert_add_u32(key, docid)?;
             }
