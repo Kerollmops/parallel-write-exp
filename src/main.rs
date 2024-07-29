@@ -11,7 +11,9 @@ use clap::{Parser, ValueEnum};
 use documents::DocumentsBatchReader;
 use fields_ids_map::FieldsIdsMap;
 use heed::types::Bytes;
-use heed::{PutFlags, RoTxn};
+use heed::RoTxn;
+use indicatif::{MultiProgress, ParallelProgressIterator, ProgressBar, ProgressStyle};
+use items_pool::ItemsPool;
 use main_database::MainDatabase;
 use memmap2::Mmap;
 use obkv::{KvReaderU16, KvWriterU16};
@@ -29,6 +31,7 @@ mod concurrent_docids;
 mod del_add;
 mod documents;
 mod fields_ids_map;
+mod items_pool;
 mod main_database;
 mod obkv_codec;
 mod roaring_bitmap_codec;
@@ -106,13 +109,59 @@ fn main() -> anyhow::Result<()> {
         },
     );
 
-    let (tree_infos_sender, tree_infos) = std::sync::mpsc::sync_channel(100);
+    // TODO Make this number configurable and maybe a multiple of the number of indexing threads.
+    let (tree_infos_sender, tree_infos) = std::sync::mpsc::channel();
 
-    rayon::scope_fifo(|s| {
+    let style = ProgressStyle::with_template("{msg:<15} {wide_bar} {pos}/{len}").unwrap();
+    let mp = MultiProgress::new();
+    let docp = mp.add(
+        ProgressBar::new(document_versions.len() as u64)
+            .with_style(style.clone())
+            .with_message("documents"),
+    );
+    let wdp = mp.add(
+        ProgressBar::new(document_versions.len() as u64)
+            .with_style(style)
+            .with_message("word docid"),
+    );
+
+    rayon::scope(|s| {
+        s.spawn(|_s| {
+            let before = Instant::now();
+            let word_docids_cache_pool = ItemsPool::new(|| {
+                println!("Creating new word docids cached tree");
+                tempdb.del_add_word_docids.clone()
+            });
+            merged_documents
+                .clone()
+                .progress_with(wdp)
+                .try_for_each_init(
+                    || maindb.env.read_txn(),
+                    |rtxn_result, result| {
+                        let Ok(rtxn) = rtxn_result else { todo!("handle rtxn issue") };
+                        word_docids_cache_pool.with(|cache| {
+                            let (docid, new_document) = result?;
+                            let old_document = maindb.documents.get(rtxn, &docid)?;
+                            extract_word_docids(docid, old_document, &new_document, cache)?;
+                            Ok(()) as anyhow::Result<_>
+                        })
+                    },
+                )
+                .unwrap();
+
+            // TODO Do that in parallel and handle errors
+            for cache in word_docids_cache_pool.into_items() {
+                cache.into_tree().unwrap();
+            }
+
+            eprintln!("Done extracting word docids in {:.02?}", before.elapsed());
+        });
+
         // This task is meant to send the documents directly to the LMDB writer.
         // It is the first task because it's the fastest to process.
-        s.spawn_fifo(|_s| {
-            let result = merged_documents.clone().try_for_each(|result| {
+        s.spawn(|_s| {
+            let before = Instant::now();
+            let result = merged_documents.clone().progress_with(docp).try_for_each(|result| {
                 let (docid, document) = result?;
                 let _ = tree_infos_sender.send(TreeInfo::Document { docid, document });
                 Ok(())
@@ -121,30 +170,10 @@ fn main() -> anyhow::Result<()> {
             if let Err(error) = result {
                 let _ = tree_infos_sender.send(TreeInfo::Error(error));
             }
-        });
 
-        s.spawn_fifo(|_s| {
-            merged_documents
-                .clone()
-                .try_for_each_init(
-                    || {
-                        let cache = tempdb.del_add_word_docids.clone();
-                        let guarded_cache = scopeguard::guard(cache, |cache| {
-                            // let tree = cache.into_tree().unwrap();
-                            // eprintln!("use the tree with {} values", tree.len());
-                            eprintln!("use the tree");
-                        });
-                        maindb.env.read_txn().map(|rtxn| (rtxn, guarded_cache))
-                    },
-                    |init_result, result| {
-                        let Ok((rtxn, cache)) = init_result else { todo!("handle rtxn issue") };
-                        let (internal_docid, new_document) = result?;
-                        let old_document = maindb.documents.get(rtxn, &internal_docid)?;
-                        extract_word_docids(internal_docid, old_document, &new_document, cache)?;
-                        Ok(()) as anyhow::Result<_>
-                    },
-                )
-                .unwrap()
+            eprintln!("Done extracting documents in {:.02?}", before.elapsed());
+            // WARN You *must* explicitly drop it or it will be dropped too late
+            drop(tree_infos_sender);
         });
 
         eprintln!("I am running...");
@@ -162,9 +191,11 @@ fn main() -> anyhow::Result<()> {
                 TreeInfo::WordDocids { tree } => todo!(),
                 TreeInfo::Error(_) => todo!(),
             }
-            rayon::yield_now();
+            // rayon::yield_now();
         }
         // wtxn.commit()?;
+
+        eprintln!("I am done...");
 
         Ok(()) as anyhow::Result<_>
     })?;

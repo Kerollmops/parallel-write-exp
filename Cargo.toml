@@ -9,9 +9,11 @@ bimap = { version = "0.6.3", features = ["serde"] }
 byte-unit = "5.1.4"
 charabia = "0.9.0"
 clap = { version = "4.5.10", features = ["derive"] }
+crossbeam-channel = "0.5.13"
 csv = "1.3.0"
 grenad = "0.4.7"
 heed = { version = "0.20.3", features = ["read-txn-no-tls"] }
+indicatif = { version = "0.17.8", features = ["rayon"] }
 lorem-ipsum-generator = "0.1.0"
 lru = "0.12.3"
 memmap2 = "0.9.4"
