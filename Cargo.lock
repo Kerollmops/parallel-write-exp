@@ -1310,6 +1310,7 @@ dependencies = [
  "anyhow",
  "bimap",
  "byte-unit",
+ "byteorder",
  "charabia",
  "clap",
  "crossbeam-channel",

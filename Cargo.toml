@@ -7,6 +7,7 @@ edition = "2021"
 anyhow = "1.0.86"
 bimap = { version = "0.6.3", features = ["serde"] }
 byte-unit = "5.1.4"
+byteorder = "1.5.0"
 charabia = "0.9.0"
 clap = { version = "4.5.10", features = ["derive"] }
 crossbeam-channel = "0.5.13"

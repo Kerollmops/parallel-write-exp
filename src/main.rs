@@ -1,33 +1,37 @@
-use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::Cursor;
 use std::num::NonZeroUsize;
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Context;
-use charabia::normalizer::NormalizerOption;
-use charabia::{Normalize, Tokenize, TokenizerBuilder};
+use charabia::TokenizerBuilder;
 use clap::{Parser, ValueEnum};
+use codec::{CboRoaringBitmapCodec, RoaringBitmapCodec};
+use del_add::DelAdd;
 use documents::DocumentsBatchReader;
 use fields_ids_map::FieldsIdsMap;
 use grenad::{MergerBuilder, Reader, Sorter};
 use heed::types::Bytes;
-use heed::{PutFlags, RoTxn};
+use heed::{Database, PutFlags, RoTxn};
 use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
 use items_pool::ItemsPool;
 use main_database::MainDatabase;
 use memmap2::Mmap;
-use obkv::{KvReaderU16, KvWriterU16};
+use merge::DelAddRoaringBitmapMerger;
+use obkv::{KvReader, KvReaderU16, KvWriterU16};
 use rayon::iter::{IntoParallelRefIterator, ParallelBridge, ParallelIterator};
+use roaring::{MultiOps, RoaringBitmap};
 use sequential_docids::SequentialDocids;
-use temp_database::{CachedSorter, DelAddRoaringBitmapMerger};
+use temp_database::CachedSorter;
 use walkdir::WalkDir;
 
 pub type FieldId = u16;
 pub type DocumentId = u32;
+pub type KvReaderDelAdd = KvReader<DelAdd>;
 pub type BEU32 = heed::types::U32<heed::byteorder::BE>;
 pub type Object = serde_json::Map<String, serde_json::Value>;
 
@@ -36,6 +40,7 @@ const LRU_CACHE_SIZE: NonZeroUsize = match NonZeroUsize::new(10_000) {
     None => NonZeroUsize::MIN,
 };
 
+mod codec;
 mod concurrent_docids;
 mod del_add;
 mod documents;
@@ -43,8 +48,7 @@ mod extract;
 mod fields_ids_map;
 mod items_pool;
 mod main_database;
-mod obkv_codec;
-mod roaring_bitmap_codec;
+mod merge;
 mod sequential_docids;
 mod temp_database;
 
@@ -159,7 +163,9 @@ fn main() -> anyhow::Result<()> {
                     CachedSorter::new(LRU_CACHE_SIZE, Sorter::new(DelAddRoaringBitmapMerger)),
                 ))
             });
-            let p = ProgressBar::new(documents_count).with_style(style).with_message("word docids");
+            let p = ProgressBar::new(documents_count)
+                .with_style(style.clone())
+                .with_message("word docids");
             let result = merged_documents.clone().progress_with(p.clone()).try_for_each(|result| {
                 context_pool.with(|(rtxn, tokenizer, cache)| {
                     let (docid, new_document) = result?;
@@ -188,6 +194,8 @@ fn main() -> anyhow::Result<()> {
                 })
                 .collect();
 
+            let rtxn = maindb.env.read_txn().unwrap();
+            let word_docids = maindb.word_docids.remap_key_type::<Bytes>();
             let _ = tree_infos_sender.send(match result {
                 Ok(reader_cursors) => {
                     // TODO make this multithreaded
@@ -196,10 +204,27 @@ fn main() -> anyhow::Result<()> {
                         merger_builder.extend(reader_cursors);
                     }
                     let merger = merger_builder.build();
-                    // TODO handle errors
+
                     let mut writer = tempfile::tempfile().map(grenad::Writer::new).unwrap();
-                    todo!("merge the content with the on-disk roaring bitmaps");
-                    merger.write_into_stream_writer(&mut writer).unwrap();
+                    let mut buffer = Vec::new();
+                    let mut iter = merger.into_stream_merger_iter().unwrap();
+                    while let Some((key, val)) = iter.next().unwrap() {
+                        buffer.clear();
+                        match merge_del_add_with_cbo_roaring_bitmap(
+                            word_docids,
+                            &rtxn,
+                            key,
+                            val.into(),
+                            &mut buffer,
+                        )
+                        .unwrap()
+                        {
+                            Some(bitmap_bytes) => writer.insert(key, bitmap_bytes).unwrap(),
+                            None => continue,
+                        }
+                    }
+
+                    // merger.write_into_stream_writer(&mut writer).unwrap();
                     let file = writer.into_inner().unwrap();
                     let reader = Reader::new(file).unwrap();
                     TreeInfo::WordDocids { reader }
@@ -229,13 +254,22 @@ fn main() -> anyhow::Result<()> {
                     )?;
                 }
                 TreeInfo::WordDocids { reader } => {
+                    let before = Instant::now();
+                    let p = ProgressBar::new(documents_count)
+                        .with_style(style.clone())
+                        .with_message("writing word docids");
                     let mut cursor = reader.into_cursor()?;
                     while let Some((key, value)) = cursor.move_on_next()? {
                         maindb
                             .word_docids
                             .remap_types::<Bytes, Bytes>()
                             .put_with_flags(&mut wtxn, put_flag, key, value)?;
+                        p.inc(1);
                     }
+                    p.finish_with_message(format!(
+                        "Done writing word docids in {:.02?}",
+                        before.elapsed()
+                    ))
                 }
                 TreeInfo::Error(error) => return Err(error),
             }
@@ -251,6 +285,37 @@ fn main() -> anyhow::Result<()> {
     eprintln!("Computing the new documents version took {:.02?}", before_print.elapsed());
 
     Ok(())
+}
+
+fn merge_del_add_with_cbo_roaring_bitmap<'b>(
+    word_docids: Database<Bytes, RoaringBitmapCodec>,
+    rtxn: &RoTxn,
+    key: &[u8],
+    del_add: &KvReader<DelAdd>,
+    buffer: &'b mut Vec<u8>,
+) -> heed::Result<Option<&'b [u8]>> {
+    match word_docids.get(rtxn, key)? {
+        Some(mut previous_bitmap) => {
+            if let Some(bitmap_bytes) = del_add.get(DelAdd::Deletion) {
+                let bitmap = RoaringBitmap::deserialize_unchecked_from(bitmap_bytes)?;
+                previous_bitmap -= bitmap;
+            }
+            if let Some(bitmap_bytes) = del_add.get(DelAdd::Addition) {
+                let bitmap = RoaringBitmap::deserialize_unchecked_from(bitmap_bytes)?;
+                previous_bitmap |= bitmap;
+            }
+            Ok(Some(CboRoaringBitmapCodec::serialize_into(&previous_bitmap, buffer)))
+        }
+        None => match del_add.get(DelAdd::Addition) {
+            Some(bitmap_bytes) => {
+                // TODO introduce a CboRoaringBitmap::reencode method
+                //      that will or not reencode the bitmap, depending on the length
+                let bitmap = RoaringBitmap::deserialize_unchecked_from(bitmap_bytes)?;
+                Ok(Some(CboRoaringBitmapCodec::serialize_into(&bitmap, buffer)))
+            }
+            None => Ok(None),
+        },
+    }
 }
 
 fn merge_document_obkv(

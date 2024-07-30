@@ -25,7 +25,7 @@ impl Key for DelAdd {
         match u8::from_be_bytes(array) {
             0 => Self::Deletion,
             1 => Self::Addition,
-            otherwise => unreachable!("DelAdd has only 2 variants, unknown variant: {}", otherwise),
+            otherwise => unreachable!("DelAdd has only 2 variants, unknown variant: {otherwise}"),
         }
     }
 }

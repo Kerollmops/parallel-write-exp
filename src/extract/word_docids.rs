@@ -4,7 +4,8 @@ use charabia::normalizer::NormalizerOption;
 use charabia::{Normalize, Tokenizer};
 use obkv::KvReaderU16;
 
-use crate::temp_database::{CachedSorter, DelAddRoaringBitmapMerger};
+use crate::merge::DelAddRoaringBitmapMerger;
+use crate::temp_database::CachedSorter;
 use crate::DocumentId;
 
 // TODO type the CachedTree

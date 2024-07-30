@@ -4,9 +4,8 @@ use heed::types::{SerdeJson, Str};
 use heed::{Database, Env, EnvOpenOptions, RoTxn, Unspecified};
 use roaring::RoaringBitmap;
 
+use crate::codec::{ObkvCodec, RoaringBitmapCodec};
 use crate::fields_ids_map::FieldsIdsMap;
-use crate::obkv_codec::ObkvCodec;
-use crate::roaring_bitmap_codec::RoaringBitmapCodec;
 use crate::BEU32;
 
 #[derive(Clone)]
