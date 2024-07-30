@@ -19,6 +19,9 @@ pub(crate) struct MainDatabase {
     /// Maps the external documents ids with the internal document id.
     pub external_documents_ids: Database<Str, BEU32>,
 
+    /// A word and all the documents ids containing the word.
+    pub(crate) word_docids: Database<Str, RoaringBitmapCodec>,
+
     /// Maps the document id to the document as an obkv store.
     pub(crate) documents: Database<BEU32, ObkvCodec>,
     // pub(crate) word_docids: Database<Str, RoaringBitmapCodec>,
@@ -32,11 +35,11 @@ impl MainDatabase {
         let main = env.create_database(&mut wtxn, Some("main"))?;
         let external_documents_ids =
             env.create_database(&mut wtxn, Some("external-documents-ids"))?;
+        let word_docids = env.create_database(&mut wtxn, Some("word-docids"))?;
         let documents = env.create_database(&mut wtxn, Some("documents"))?;
-        // let word_docids = env.create_database(&mut wtxn, Some("word-docids"))?;
         wtxn.commit()?;
 
-        Ok(MainDatabase { env, main, external_documents_ids, documents })
+        Ok(MainDatabase { env, main, external_documents_ids, word_docids, documents })
     }
 
     pub fn document_ids(&self, rtxn: &RoTxn) -> heed::Result<RoaringBitmap> {

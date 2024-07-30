@@ -1,6 +1,8 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::Cursor;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -11,8 +13,9 @@ use charabia::{Normalize, Tokenize, TokenizerBuilder};
 use clap::{Parser, ValueEnum};
 use documents::DocumentsBatchReader;
 use fields_ids_map::FieldsIdsMap;
+use grenad::{MergerBuilder, Reader, Sorter};
 use heed::types::Bytes;
-use heed::RoTxn;
+use heed::{PutFlags, RoTxn};
 use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
 use items_pool::ItemsPool;
 use main_database::MainDatabase;
@@ -20,13 +23,18 @@ use memmap2::Mmap;
 use obkv::{KvReaderU16, KvWriterU16};
 use rayon::iter::{IntoParallelRefIterator, ParallelBridge, ParallelIterator};
 use sequential_docids::SequentialDocids;
-use temp_database::{CachedTree, TempDatabase};
+use temp_database::{CachedSorter, DelAddRoaringBitmapMerger};
 use walkdir::WalkDir;
 
 pub type FieldId = u16;
 pub type DocumentId = u32;
 pub type BEU32 = heed::types::U32<heed::byteorder::BE>;
 pub type Object = serde_json::Map<String, serde_json::Value>;
+
+const LRU_CACHE_SIZE: NonZeroUsize = match NonZeroUsize::new(10_000) {
+    Some(v) => v,
+    None => NonZeroUsize::MIN,
+};
 
 mod concurrent_docids;
 mod del_add;
@@ -77,10 +85,11 @@ fn main() -> anyhow::Result<()> {
         path.join("update_files")
     };
     let maindb = MainDatabase::open(&index_path, size.as_u64() as usize)?;
-    let tempdb = TempDatabase::new()?;
 
     let before_fetch = Instant::now();
     let rtxn = maindb.env.read_txn()?;
+    let put_flag =
+        if maindb.documents.is_empty(&rtxn)? { PutFlags::APPEND } else { PutFlags::empty() };
     let fields_ids_map = maindb.fields_ids_map(&rtxn)?;
     let used_document_ids = maindb.document_ids(&rtxn)?;
     let mut sequential_docids = SequentialDocids::new(&used_document_ids);
@@ -147,7 +156,7 @@ fn main() -> anyhow::Result<()> {
                 Ok((
                     maindb.env.read_txn()?,
                     TokenizerBuilder::default().into_tokenizer(),
-                    tempdb.del_add_word_docids.clone(),
+                    CachedSorter::new(LRU_CACHE_SIZE, Sorter::new(DelAddRoaringBitmapMerger)),
                 ))
             });
             let p = ProgressBar::new(documents_count).with_style(style).with_message("word docids");
@@ -170,15 +179,32 @@ fn main() -> anyhow::Result<()> {
                 let _ = tree_infos_sender.send(TreeInfo::Error(error));
             }
 
-            let result: sled::Result<Vec<_>> = context_pool
+            let result: anyhow::Result<Vec<_>> = context_pool
                 .into_items()
                 .par_bridge()
-                .map(|(_rtxn, _tokenizer, cache)| cache.into_tree())
+                .map(|(_rtxn, _tokenizer, cache)| {
+                    let sorter = cache.into_sorter()?;
+                    sorter.into_reader_cursors().map_err(Into::into)
+                })
                 .collect();
 
             let _ = tree_infos_sender.send(match result {
-                Ok(mut trees) => TreeInfo::WordDocids { tree: trees.pop().unwrap() },
-                Err(error) => TreeInfo::Error(error.into()),
+                Ok(reader_cursors) => {
+                    // TODO make this multithreaded
+                    let mut merger_builder = MergerBuilder::new(DelAddRoaringBitmapMerger);
+                    for reader_cursors in reader_cursors {
+                        merger_builder.extend(reader_cursors);
+                    }
+                    let merger = merger_builder.build();
+                    // TODO handle errors
+                    let mut writer = tempfile::tempfile().map(grenad::Writer::new).unwrap();
+                    todo!("merge the content with the on-disk roaring bitmaps");
+                    merger.write_into_stream_writer(&mut writer).unwrap();
+                    let file = writer.into_inner().unwrap();
+                    let reader = Reader::new(file).unwrap();
+                    TreeInfo::WordDocids { reader }
+                }
+                Err(error) => TreeInfo::Error(error),
             });
 
             p.finish_with_message(format!(
@@ -202,8 +228,16 @@ fn main() -> anyhow::Result<()> {
                         document.as_bytes(),
                     )?;
                 }
-                TreeInfo::WordDocids { tree } => todo!(),
-                TreeInfo::Error(_) => todo!(),
+                TreeInfo::WordDocids { reader } => {
+                    let mut cursor = reader.into_cursor()?;
+                    while let Some((key, value)) = cursor.move_on_next()? {
+                        maindb
+                            .word_docids
+                            .remap_types::<Bytes, Bytes>()
+                            .put_with_flags(&mut wtxn, put_flag, key, value)?;
+                    }
+                }
+                TreeInfo::Error(error) => return Err(error),
             }
             rayon::yield_now();
         }
@@ -325,6 +359,6 @@ fn fetch_update_document_versions(
 
 enum TreeInfo {
     Document { docid: DocumentId, document: Box<KvReaderU16> },
-    WordDocids { tree: sled::Tree },
+    WordDocids { reader: grenad::Reader<File> },
     Error(anyhow::Error),
 }

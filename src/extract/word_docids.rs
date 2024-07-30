@@ -1,8 +1,10 @@
+use std::io;
+
 use charabia::normalizer::NormalizerOption;
 use charabia::{Normalize, Tokenizer};
 use obkv::KvReaderU16;
 
-use crate::temp_database::CachedTree;
+use crate::temp_database::{CachedSorter, DelAddRoaringBitmapMerger};
 use crate::DocumentId;
 
 // TODO type the CachedTree
@@ -11,8 +13,8 @@ pub fn extract_word_docids(
     previous_doc: Option<&KvReaderU16>,
     new_doc: &KvReaderU16,
     tokenizer: &Tokenizer,
-    output: &mut CachedTree,
-) -> sled::Result<()> {
+    output: &mut CachedSorter<DelAddRoaringBitmapMerger>,
+) -> grenad::Result<(), io::Error> {
     let normalizer_options = NormalizerOption::default();
 
     if let Some(previous_doc) = previous_doc {

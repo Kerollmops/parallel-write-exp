@@ -1,59 +1,35 @@
-use std::mem;
+use std::borrow::Cow;
 use std::num::NonZeroUsize;
+use std::{io, mem};
 
+use grenad::{MergeFunction, Sorter};
 use lru::LruCache;
 use roaring::RoaringBitmap;
-use sled::Tree;
 use smallvec::SmallVec;
-use tempfile::TempDir;
 
 use crate::del_add::{DelAdd, KvReaderDelAdd, KvWriterDelAdd};
 
-pub(crate) struct TempDatabase {
-    pub(crate) db: sled::Db,
-    pub(crate) tempdir: TempDir,
-    pub(crate) del_add_word_docids: CachedTree,
-}
-
-impl TempDatabase {
-    pub fn new() -> sled::Result<Self> {
-        let tempdir = tempfile::tempdir()?;
-        eprintln!("Creating temporary sled folder in {}", tempdir.path().display());
-        let db = sled::open(tempdir.path())?;
-        let cache_size = NonZeroUsize::new(1000).unwrap();
-
-        let del_add_word_docids = db.open_tree("word-docids")?;
-        del_add_word_docids.set_merge_operator(merge_del_add_roaring_bitmap);
-
-        Ok(TempDatabase {
-            db,
-            tempdir,
-            del_add_word_docids: CachedTree::new(cache_size, del_add_word_docids),
-        })
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct CachedTree {
+#[derive(Debug)]
+pub struct CachedSorter<MF> {
     cache: lru::LruCache<SmallVec<[u8; 20]>, DelAddRoaringBitmap>,
-    tree: Tree,
+    sorter: Sorter<MF>,
     deladd_buffer: Vec<u8>,
     cbo_buffer: Vec<u8>,
 }
 
-impl CachedTree {
-    pub fn new(cap: NonZeroUsize, tree: Tree) -> Self {
-        CachedTree {
+impl<MF> CachedSorter<MF> {
+    pub fn new(cap: NonZeroUsize, sorter: Sorter<MF>) -> Self {
+        CachedSorter {
             cache: lru::LruCache::new(cap),
-            tree,
+            sorter,
             deladd_buffer: Vec::new(),
             cbo_buffer: Vec::new(),
         }
     }
 }
 
-impl CachedTree {
-    pub fn insert_del_u32(&mut self, key: &[u8], n: u32) -> sled::Result<()> {
+impl<MF: MergeFunction> CachedSorter<MF> {
+    pub fn insert_del_u32(&mut self, key: &[u8], n: u32) -> grenad::Result<(), MF::Error> {
         match self.cache.get_mut(key) {
             Some(DelAddRoaringBitmap { del, add: _ }) => {
                 del.get_or_insert_with(RoaringBitmap::new).insert(n);
@@ -69,7 +45,11 @@ impl CachedTree {
         Ok(())
     }
 
-    pub fn insert_del(&mut self, key: &[u8], bitmap: RoaringBitmap) -> sled::Result<()> {
+    pub fn insert_del(
+        &mut self,
+        key: &[u8],
+        bitmap: RoaringBitmap,
+    ) -> grenad::Result<(), MF::Error> {
         match self.cache.get_mut(key) {
             Some(DelAddRoaringBitmap { del, add: _ }) => {
                 *del.get_or_insert_with(RoaringBitmap::new) |= bitmap;
@@ -85,7 +65,7 @@ impl CachedTree {
         Ok(())
     }
 
-    pub fn insert_add_u32(&mut self, key: &[u8], n: u32) -> sled::Result<()> {
+    pub fn insert_add_u32(&mut self, key: &[u8], n: u32) -> grenad::Result<(), MF::Error> {
         match self.cache.get_mut(key) {
             Some(DelAddRoaringBitmap { del: _, add }) => {
                 add.get_or_insert_with(RoaringBitmap::new).insert(n);
@@ -101,7 +81,11 @@ impl CachedTree {
         Ok(())
     }
 
-    pub fn insert_add(&mut self, key: &[u8], bitmap: RoaringBitmap) -> sled::Result<()> {
+    pub fn insert_add(
+        &mut self,
+        key: &[u8],
+        bitmap: RoaringBitmap,
+    ) -> grenad::Result<(), MF::Error> {
         match self.cache.get_mut(key) {
             Some(DelAddRoaringBitmap { del: _, add }) => {
                 *add.get_or_insert_with(RoaringBitmap::new) |= bitmap;
@@ -117,7 +101,7 @@ impl CachedTree {
         Ok(())
     }
 
-    pub fn insert_del_add_u32(&mut self, key: &[u8], n: u32) -> sled::Result<()> {
+    pub fn insert_del_add_u32(&mut self, key: &[u8], n: u32) -> grenad::Result<(), MF::Error> {
         match self.cache.get_mut(key) {
             Some(DelAddRoaringBitmap { del, add }) => {
                 del.get_or_insert_with(RoaringBitmap::new).insert(n);
@@ -138,7 +122,7 @@ impl CachedTree {
         &mut self,
         key: A,
         deladd: DelAddRoaringBitmap,
-    ) -> sled::Result<()> {
+    ) -> grenad::Result<(), MF::Error> {
         self.deladd_buffer.clear();
         let mut value_writer = KvWriterDelAdd::new(&mut self.deladd_buffer);
         match deladd {
@@ -167,17 +151,17 @@ impl CachedTree {
         Ok(())
     }
 
-    pub fn direct_insert(&mut self, key: &[u8], val: &[u8]) -> sled::Result<()> {
+    pub fn direct_insert(&mut self, key: &[u8], val: &[u8]) -> grenad::Result<(), MF::Error> {
         // self.tree.merge(key, val).map(drop)
         Ok(())
     }
 
-    pub fn into_tree(mut self) -> sled::Result<Tree> {
+    pub fn into_sorter(mut self) -> grenad::Result<Sorter<MF>, MF::Error> {
         let default_arc = LruCache::new(NonZeroUsize::MIN);
         for (key, deladd) in mem::replace(&mut self.cache, default_arc) {
             self.write_entry(key, deladd)?;
         }
-        Ok(self.tree)
+        Ok(self.sorter)
     }
 }
 
@@ -212,55 +196,54 @@ impl DelAddRoaringBitmap {
     }
 }
 
-// TODO better use cbo_roaring_bitmaps
-fn merge_del_add_roaring_bitmap(
-    _key: &[u8],
-    old_bytes: Option<&[u8]>,
-    new_bytes: &[u8],
-) -> Option<Vec<u8>> {
-    // safety: Can't we handle errors, here?
+/// Do a union of CboRoaringBitmaps on both sides of a DelAdd obkv
+/// separately and outputs a new DelAdd with both unions.
+pub struct DelAddRoaringBitmapMerger;
 
-    fn union_del_add<'a>(
-        out: &'a mut Vec<u8>,
-        key: DelAdd,
-        old_obkv: &'a KvReaderDelAdd,
-        new_obkv: &'a KvReaderDelAdd,
-    ) -> &'a [u8] {
-        match (old_obkv.get(key), new_obkv.get(key)) {
-            (None, None) => {
-                RoaringBitmap::new().serialize_into(&mut *out).unwrap();
-                out
-            }
-            (None, Some(new_bytes)) => new_bytes,
-            (Some(old_bytes), None) => old_bytes,
-            (Some(old_bytes), Some(new_bytes)) => {
-                let old = RoaringBitmap::deserialize_unchecked_from(old_bytes).unwrap();
-                let new = RoaringBitmap::deserialize_unchecked_from(new_bytes).unwrap();
-                let merge = old | new;
-                out.reserve(merge.serialized_size());
-                merge.serialize_into(&mut *out).unwrap();
-                out
-            }
-        }
-    }
+impl MergeFunction for DelAddRoaringBitmapMerger {
+    type Error = io::Error;
 
-    match old_bytes {
-        Some(old_bytes) => {
-            let old_obkv: &KvReaderDelAdd = old_bytes.into();
-            let new_obkv: &KvReaderDelAdd = new_bytes.into();
+    fn merge<'a>(
+        &self,
+        _key: &[u8],
+        values: &[Cow<'a, [u8]>],
+    ) -> std::result::Result<Cow<'a, [u8]>, Self::Error> {
+        if values.len() == 1 {
+            Ok(values[0].clone())
+        } else {
+            // Retrieve the bitmaps from both sides
+            let mut del_bitmaps_bytes = Vec::new();
+            let mut add_bitmaps_bytes = Vec::new();
+            for value in values {
+                let obkv: &KvReaderDelAdd = value.as_ref().into();
+                if let Some(bitmap_bytes) = obkv.get(DelAdd::Deletion) {
+                    del_bitmaps_bytes.push(bitmap_bytes);
+                }
+                if let Some(bitmap_bytes) = obkv.get(DelAdd::Addition) {
+                    add_bitmaps_bytes.push(bitmap_bytes);
+                }
+            }
 
             let mut output_deladd_obkv = KvWriterDelAdd::memory();
 
+            // Deletion
             let mut buffer = Vec::new();
-            let del_bytes = union_del_add(&mut buffer, DelAdd::Deletion, old_obkv, new_obkv);
-            output_deladd_obkv.insert(DelAdd::Deletion, del_bytes).unwrap();
+            let mut merged = RoaringBitmap::new();
+            for bytes in del_bitmaps_bytes {
+                merged |= RoaringBitmap::deserialize_unchecked_from(bytes)?;
+            }
+            merged.serialize_into(&mut buffer);
+            output_deladd_obkv.insert(DelAdd::Deletion, &buffer)?;
 
+            // Addition
             buffer.clear();
-            let add_bytes = union_del_add(&mut buffer, DelAdd::Addition, old_obkv, new_obkv);
-            output_deladd_obkv.insert(DelAdd::Addition, add_bytes).unwrap();
+            merged.clear();
+            for bytes in add_bitmaps_bytes {
+                merged |= RoaringBitmap::deserialize_unchecked_from(bytes)?;
+            }
+            output_deladd_obkv.insert(DelAdd::Addition, &buffer)?;
 
-            Some(output_deladd_obkv.into_inner().unwrap())
+            output_deladd_obkv.into_inner().map(Cow::from).map_err(Into::into)
         }
-        None => Some(new_bytes.to_vec()),
     }
 }
