@@ -147,13 +147,12 @@ impl<MF: MergeFunction> CachedSorter<MF> {
             }
             DelAddRoaringBitmap { del: None, add: None } => return Ok(()),
         }
-        // self.tree.merge(key, value_writer.into_inner().unwrap()).map(drop)
-        Ok(())
+        let bytes = value_writer.into_inner().unwrap();
+        self.sorter.insert(key, bytes)
     }
 
     pub fn direct_insert(&mut self, key: &[u8], val: &[u8]) -> grenad::Result<(), MF::Error> {
-        // self.tree.merge(key, val).map(drop)
-        Ok(())
+        self.sorter.insert(key, val)
     }
 
     pub fn into_sorter(mut self) -> grenad::Result<Sorter<MF>, MF::Error> {
@@ -232,7 +231,7 @@ impl MergeFunction for DelAddRoaringBitmapMerger {
             for bytes in del_bitmaps_bytes {
                 merged |= RoaringBitmap::deserialize_unchecked_from(bytes)?;
             }
-            merged.serialize_into(&mut buffer);
+            merged.serialize_into(&mut buffer)?;
             output_deladd_obkv.insert(DelAdd::Deletion, &buffer)?;
 
             // Addition

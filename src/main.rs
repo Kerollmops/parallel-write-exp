@@ -1,8 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
-use std::io::Cursor;
+use std::io::{Cursor, Seek, SeekFrom};
 use std::num::NonZeroUsize;
-use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -24,7 +23,7 @@ use memmap2::Mmap;
 use merge::DelAddRoaringBitmapMerger;
 use obkv::{KvReader, KvReaderU16, KvWriterU16};
 use rayon::iter::{IntoParallelRefIterator, ParallelBridge, ParallelIterator};
-use roaring::{MultiOps, RoaringBitmap};
+use roaring::RoaringBitmap;
 use sequential_docids::SequentialDocids;
 use temp_database::CachedSorter;
 use walkdir::WalkDir;
@@ -205,9 +204,15 @@ fn main() -> anyhow::Result<()> {
                     }
                     let merger = merger_builder.build();
 
+                    let before = Instant::now();
+                    let p = ProgressBar::new_spinner()
+                        .with_style(style.clone())
+                        .with_message("merging & writing word docids");
+
                     let mut writer = tempfile::tempfile().map(grenad::Writer::new).unwrap();
                     let mut buffer = Vec::new();
                     let mut iter = merger.into_stream_merger_iter().unwrap();
+                    let mut values_count = 0;
                     while let Some((key, val)) = iter.next().unwrap() {
                         buffer.clear();
                         match merge_del_add_with_cbo_roaring_bitmap(
@@ -222,11 +227,20 @@ fn main() -> anyhow::Result<()> {
                             Some(bitmap_bytes) => writer.insert(key, bitmap_bytes).unwrap(),
                             None => continue,
                         }
+                        values_count += 1;
+                        p.inc(1);
                     }
 
                     // merger.write_into_stream_writer(&mut writer).unwrap();
-                    let file = writer.into_inner().unwrap();
+                    let mut file = writer.into_inner().unwrap();
+                    file.rewind().unwrap();
                     let reader = Reader::new(file).unwrap();
+
+                    p.finish_with_message(format!(
+                        "Done merging the {values_count} word docids in {:.02?}",
+                        before.elapsed()
+                    ));
+
                     TreeInfo::WordDocids { reader }
                 }
                 Err(error) => TreeInfo::Error(error),
@@ -255,15 +269,17 @@ fn main() -> anyhow::Result<()> {
                 }
                 TreeInfo::WordDocids { reader } => {
                     let before = Instant::now();
-                    let p = ProgressBar::new(documents_count)
+                    let p = ProgressBar::new(reader.len())
                         .with_style(style.clone())
                         .with_message("writing word docids");
                     let mut cursor = reader.into_cursor()?;
                     while let Some((key, value)) = cursor.move_on_next()? {
-                        maindb
-                            .word_docids
-                            .remap_types::<Bytes, Bytes>()
-                            .put_with_flags(&mut wtxn, put_flag, key, value)?;
+                        if key.len() <= 511 && !key.is_empty() {
+                            maindb
+                                .word_docids
+                                .remap_types::<Bytes, Bytes>()
+                                .put_with_flags(&mut wtxn, put_flag, key, value)?;
+                        }
                         p.inc(1);
                     }
                     p.finish_with_message(format!(
@@ -288,20 +304,23 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn merge_del_add_with_cbo_roaring_bitmap<'b>(
-    word_docids: Database<Bytes, RoaringBitmapCodec>,
+    word_docids: Database<Bytes, CboRoaringBitmapCodec>,
     rtxn: &RoTxn,
     key: &[u8],
     del_add: &KvReader<DelAdd>,
     buffer: &'b mut Vec<u8>,
 ) -> heed::Result<Option<&'b [u8]>> {
-    match word_docids.get(rtxn, key)? {
+    if key.is_empty() {
+        return Ok(None);
+    }
+    match word_docids.get(rtxn, key).unwrap() {
         Some(mut previous_bitmap) => {
             if let Some(bitmap_bytes) = del_add.get(DelAdd::Deletion) {
-                let bitmap = RoaringBitmap::deserialize_unchecked_from(bitmap_bytes)?;
+                let bitmap = RoaringBitmap::deserialize_unchecked_from(bitmap_bytes).unwrap();
                 previous_bitmap -= bitmap;
             }
             if let Some(bitmap_bytes) = del_add.get(DelAdd::Addition) {
-                let bitmap = RoaringBitmap::deserialize_unchecked_from(bitmap_bytes)?;
+                let bitmap = RoaringBitmap::deserialize_unchecked_from(bitmap_bytes).unwrap();
                 previous_bitmap |= bitmap;
             }
             Ok(Some(CboRoaringBitmapCodec::serialize_into(&previous_bitmap, buffer)))
@@ -310,7 +329,7 @@ fn merge_del_add_with_cbo_roaring_bitmap<'b>(
             Some(bitmap_bytes) => {
                 // TODO introduce a CboRoaringBitmap::reencode method
                 //      that will or not reencode the bitmap, depending on the length
-                let bitmap = RoaringBitmap::deserialize_unchecked_from(bitmap_bytes)?;
+                let bitmap = RoaringBitmap::deserialize_unchecked_from(bitmap_bytes).unwrap();
                 Ok(Some(CboRoaringBitmapCodec::serialize_into(&bitmap, buffer)))
             }
             None => Ok(None),

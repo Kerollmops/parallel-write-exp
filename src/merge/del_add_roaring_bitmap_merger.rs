@@ -51,6 +51,7 @@ impl MergeFunction for DelAddRoaringBitmapMerger {
             for bytes in add_bitmaps_bytes {
                 merged |= RoaringBitmap::deserialize_unchecked_from(bytes)?;
             }
+            merged.serialize_into(&mut buffer)?;
             output_deladd_obkv.insert(DelAdd::Addition, &buffer)?;
 
             output_deladd_obkv.into_inner().map(Cow::from).map_err(Into::into)

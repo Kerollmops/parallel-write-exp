@@ -23,8 +23,10 @@ pub fn extract_word_docids(
             // Only manage the direct JSON strings
             if v.first().zip(v.last()) == Some((&b'"', &b'"')) {
                 let s = std::str::from_utf8(&v[1..v.len() - 1]).unwrap();
-                for token in tokenizer.tokenize(s).filter(|t| t.is_word()) {
-                    let key = token.lemma().normalize(&normalizer_options);
+                // for token in tokenizer.tokenize(s).filter(|t| t.is_word()) {
+                //     let key = token.lemma().normalize(&normalizer_options);
+                for token in s.split_whitespace() {
+                    let key = token.normalize(&normalizer_options);
                     output.insert_del_u32(key.as_bytes(), docid)?;
                 }
             }
@@ -35,8 +37,10 @@ pub fn extract_word_docids(
         // Only manage the direct JSON strings
         if v.first().zip(v.last()) == Some((&b'"', &b'"')) {
             let s = std::str::from_utf8(&v[1..v.len() - 1]).unwrap();
-            for token in tokenizer.tokenize(s).filter(|t| t.is_word()) {
-                let key = token.lemma().normalize(&normalizer_options);
+            // for token in tokenizer.tokenize(s).filter(|t| t.is_word()) {
+            //     let key = token.lemma().normalize(&normalizer_options);
+            for token in s.split_whitespace() {
+                let key = token.normalize(&normalizer_options);
                 output.insert_add_u32(key.as_bytes(), docid)?;
             }
         }

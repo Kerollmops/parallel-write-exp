@@ -4,7 +4,7 @@ use heed::types::{SerdeJson, Str};
 use heed::{Database, Env, EnvOpenOptions, RoTxn, Unspecified};
 use roaring::RoaringBitmap;
 
-use crate::codec::{ObkvCodec, RoaringBitmapCodec};
+use crate::codec::{CboRoaringBitmapCodec, ObkvCodec, RoaringBitmapCodec};
 use crate::fields_ids_map::FieldsIdsMap;
 use crate::BEU32;
 
@@ -19,7 +19,7 @@ pub(crate) struct MainDatabase {
     pub external_documents_ids: Database<Str, BEU32>,
 
     /// A word and all the documents ids containing the word.
-    pub(crate) word_docids: Database<Str, RoaringBitmapCodec>,
+    pub(crate) word_docids: Database<Str, CboRoaringBitmapCodec>,
 
     /// Maps the document id to the document as an obkv store.
     pub(crate) documents: Database<BEU32, ObkvCodec>,
