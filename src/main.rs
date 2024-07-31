@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
-use std::io::{Cursor, Seek, SeekFrom};
+use std::io::{Cursor, Seek};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -9,14 +9,14 @@ use std::time::Instant;
 use anyhow::Context;
 use charabia::TokenizerBuilder;
 use clap::{Parser, ValueEnum};
-use codec::{CboRoaringBitmapCodec, RoaringBitmapCodec};
+use codec::CboRoaringBitmapCodec;
 use del_add::DelAdd;
 use documents::DocumentsBatchReader;
 use fields_ids_map::FieldsIdsMap;
 use grenad::{MergerBuilder, Reader, Sorter};
 use heed::types::Bytes;
 use heed::{Database, PutFlags, RoTxn};
-use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ParallelProgressIterator, ProgressBar, ProgressStyle};
 use items_pool::ItemsPool;
 use main_database::MainDatabase;
 use memmap2::Mmap;
@@ -128,33 +128,35 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let style = ProgressStyle::with_template("{msg:<15} {wide_bar} {pos}/{len} {eta}").unwrap();
+    let style =
+        ProgressStyle::with_template("{msg:<25} [{elapsed}] {wide_bar} {pos}/{len} {eta}").unwrap();
     let (tree_infos_sender, tree_infos) = crossbeam_channel::unbounded();
 
     rayon::scope(|s| {
         s.spawn(|_s| {
             // This task is meant to send the documents directly to the LMDB writer.
             // It is the first task because it's the fastest to process.
-            let before = Instant::now();
-            let p = ProgressBar::new(documents_count)
+            let documents_progress = ProgressBar::new(documents_count)
                 .with_style(style.clone())
-                .with_message("documents");
-            let result = merged_documents.clone().progress_with(p.clone()).try_for_each(|result| {
-                let (docid, document) = result?;
-                let _ = tree_infos_sender.send(TreeInfo::Document { docid, document });
-                Ok(())
-            });
+                .with_message("extract documents");
+            let result = merged_documents
+                .clone()
+                .progress_with(documents_progress.clone())
+                .try_for_each(|result| {
+                    let (docid, document) = result?;
+                    let _ = tree_infos_sender.send(TreeInfo::Document { docid, document });
+                    Ok(())
+                });
 
             if let Err(error) = result {
                 let _ = tree_infos_sender.send(TreeInfo::Error(error));
             }
 
-            p.finish_with_message(format!(
-                "Done extracting documents in {:.02?}",
-                before.elapsed()
-            ));
+            documents_progress.finish_with_message("documents extracted");
 
-            let before = Instant::now();
+            let word_docids_progress = ProgressBar::new(documents_count)
+                .with_style(style.clone())
+                .with_message("extract word docids");
             let context_pool = ItemsPool::new(|| {
                 Ok((
                     maindb.env.read_txn()?,
@@ -162,41 +164,53 @@ fn main() -> anyhow::Result<()> {
                     CachedSorter::new(LRU_CACHE_SIZE, Sorter::new(DelAddRoaringBitmapMerger)),
                 ))
             });
-            let p = ProgressBar::new(documents_count)
-                .with_style(style.clone())
-                .with_message("word docids");
-            let result = merged_documents.clone().progress_with(p.clone()).try_for_each(|result| {
-                context_pool.with(|(rtxn, tokenizer, cache)| {
-                    let (docid, new_document) = result?;
-                    let old_document = maindb.documents.get(rtxn, &docid)?;
-                    extract::extract_word_docids(
-                        docid,
-                        old_document,
-                        &new_document,
-                        tokenizer,
-                        cache,
-                    )?;
-                    Ok(()) as anyhow::Result<_>
-                })
-            });
+            let result = merged_documents
+                .clone()
+                .progress_with(word_docids_progress.clone())
+                .try_for_each(|result| {
+                    context_pool.with(|(rtxn, tokenizer, cache)| {
+                        let (docid, new_document) = result?;
+                        let old_document = maindb.documents.get(rtxn, &docid)?;
+                        extract::extract_word_docids(
+                            docid,
+                            old_document,
+                            &new_document,
+                            tokenizer,
+                            cache,
+                        )?;
+                        Ok(()) as anyhow::Result<_>
+                    })
+                });
+
+            word_docids_progress.finish_with_message("word docids extracted");
 
             if let Err(error) = result {
                 let _ = tree_infos_sender.send(TreeInfo::Error(error));
             }
 
+            let dump_word_docids_progress = ProgressBar::new_spinner()
+                .with_style(style.clone())
+                .with_message("dump word docids");
             let result: anyhow::Result<Vec<_>> = context_pool
                 .into_items()
                 .par_bridge()
+                .progress_with(dump_word_docids_progress.clone())
                 .map(|(_rtxn, _tokenizer, cache)| {
                     let sorter = cache.into_sorter()?;
                     sorter.into_reader_cursors().map_err(Into::into)
                 })
                 .collect();
 
+            dump_word_docids_progress.finish_with_message("word docids cache dumped");
+
             let rtxn = maindb.env.read_txn().unwrap();
             let word_docids = maindb.word_docids.remap_key_type::<Bytes>();
             let _ = tree_infos_sender.send(match result {
                 Ok(reader_cursors) => {
+                    let merging_writing_word_docids_progress = ProgressBar::new_spinner()
+                        .with_style(style.clone())
+                        .with_message("merging & writing word docids");
+
                     // TODO make this multithreaded
                     let mut merger_builder = MergerBuilder::new(DelAddRoaringBitmapMerger);
                     for reader_cursors in reader_cursors {
@@ -204,15 +218,9 @@ fn main() -> anyhow::Result<()> {
                     }
                     let merger = merger_builder.build();
 
-                    let before = Instant::now();
-                    let p = ProgressBar::new_spinner()
-                        .with_style(style.clone())
-                        .with_message("merging & writing word docids");
-
                     let mut writer = tempfile::tempfile().map(grenad::Writer::new).unwrap();
                     let mut buffer = Vec::new();
                     let mut iter = merger.into_stream_merger_iter().unwrap();
-                    let mut values_count = 0;
                     while let Some((key, val)) = iter.next().unwrap() {
                         buffer.clear();
                         match merge_del_add_with_cbo_roaring_bitmap(
@@ -227,8 +235,8 @@ fn main() -> anyhow::Result<()> {
                             Some(bitmap_bytes) => writer.insert(key, bitmap_bytes).unwrap(),
                             None => continue,
                         }
-                        values_count += 1;
-                        p.inc(1);
+                        merging_writing_word_docids_progress.inc(1);
+                        merging_writing_word_docids_progress.tick();
                     }
 
                     // merger.write_into_stream_writer(&mut writer).unwrap();
@@ -236,20 +244,12 @@ fn main() -> anyhow::Result<()> {
                     file.rewind().unwrap();
                     let reader = Reader::new(file).unwrap();
 
-                    p.finish_with_message(format!(
-                        "Done merging the {values_count} word docids in {:.02?}",
-                        before.elapsed()
-                    ));
+                    merging_writing_word_docids_progress.finish_with_message("word docids merged");
 
                     TreeInfo::WordDocids { reader }
                 }
                 Err(error) => TreeInfo::Error(error),
             });
-
-            p.finish_with_message(format!(
-                "Done extracting word docids in {:.02?}",
-                before.elapsed()
-            ));
 
             // WARN You *must* explicitly drop it or it will be dropped too late
             drop(tree_infos_sender);
@@ -268,7 +268,6 @@ fn main() -> anyhow::Result<()> {
                     )?;
                 }
                 TreeInfo::WordDocids { reader } => {
-                    let before = Instant::now();
                     let p = ProgressBar::new(reader.len())
                         .with_style(style.clone())
                         .with_message("writing word docids");
@@ -279,13 +278,10 @@ fn main() -> anyhow::Result<()> {
                                 .word_docids
                                 .remap_types::<Bytes, Bytes>()
                                 .put_with_flags(&mut wtxn, put_flag, key, value)?;
+                            p.inc(1);
                         }
-                        p.inc(1);
                     }
-                    p.finish_with_message(format!(
-                        "Done writing word docids in {:.02?}",
-                        before.elapsed()
-                    ))
+                    p.finish_with_message("word docids written");
                 }
                 TreeInfo::Error(error) => return Err(error),
             }
