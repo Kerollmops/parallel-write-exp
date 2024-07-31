@@ -1,0 +1,7 @@
+mod merge_word_docids_cursors_into_reader;
+mod par_extract_word_docids;
+mod par_send_merged_documents;
+
+pub use merge_word_docids_cursors_into_reader::merge_word_docids_cursors_into_reader;
+pub use par_extract_word_docids::par_extract_word_docids;
+pub use par_send_merged_documents::par_send_merged_documents;
