@@ -110,6 +110,7 @@ fn main() -> anyhow::Result<()> {
 
     // This rayon iterator can be cloned and used in multiple threads.
     // Its purpose is to generate the new version of the documents by merging it with the version of the RoTxn.
+    // TODO prefer using an ItemsPool so that we can return an error if we cannot open an rotxn
     let merged_documents = document_versions.par_iter().map_init(
         || maindb.env.read_txn(),
         |result_rtxn, (_external_id, (internal_id, offsets))| {

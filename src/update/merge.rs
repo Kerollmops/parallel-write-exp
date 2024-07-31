@@ -22,8 +22,12 @@ use crate::DocumentId;
 pub type MapDocumentsIdsVersions =
     HashMap<SmartString<Compact>, (DocumentId, SmallVec<[DocumentOffset; 4]>)>;
 
+/// Represents an offset where a document lives
+/// in an mmapped grenad reader file.
 pub struct DocumentOffset {
+    /// The mmapped grenad reader file.
     pub content: Arc<Mmap>,
+    /// The offset of the document in the file.
     pub offset: u32,
 }
 
