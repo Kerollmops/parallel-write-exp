@@ -119,7 +119,7 @@ fn main() -> anyhow::Result<()> {
         },
     );
 
-    let (tree_infos_sender, tree_infos) = crossbeam_channel::unbounded();
+    let (tree_infos_sender, tree_infos) = crossbeam_channel::bounded(10_000);
     rayon::scope(|s| {
         s.spawn(|_s| {
             if let Err(e) = par_send_merged_documents(
@@ -188,7 +188,7 @@ fn main() -> anyhow::Result<()> {
                 }
                 TreeInfo::Error(error) => return Err(error),
             }
-            rayon::yield_now();
+            // rayon::yield_now();
         }
         // wtxn.commit()?;
 

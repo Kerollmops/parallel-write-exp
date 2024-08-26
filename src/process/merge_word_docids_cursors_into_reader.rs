@@ -58,6 +58,7 @@ pub fn merge_word_docids_cursors_into_reader(
             Some(bitmap_bytes) => writer.insert(key, bitmap_bytes)?,
             None => continue,
         }
+
         p.inc(1);
         p.tick();
     }
